@@ -213,10 +213,36 @@ export default function Home() {
       const data = await response.json();
       return data;
     },
-    onSuccess: (data) => {
-      console.log("[Home] ✅ AI improvement successful:", data);
-      queryClient.invalidateQueries({ queryKey: ["/api/sitemaps", activeCrawlId] });
-      refetchSitemap();
+    onSuccess: async (data) => {
+      console.log("[Home] ✅ AI improvement successful:", {
+        hasData: !!data,
+        isImproved: data?.isImproved,
+        hasImprovedJson: !!data?.improvedJson,
+        hasAiExplanation: !!data?.aiExplanation,
+        improvedJsonType: typeof data?.improvedJson,
+        dataKeys: data ? Object.keys(data) : [],
+      });
+      
+      // Update the query cache immediately with the new data
+      queryClient.setQueryData(["/api/sitemaps", activeCrawlId], (oldData: any) => {
+        console.log("[Home] Updating query cache:", {
+          oldData: oldData ? Object.keys(oldData) : null,
+          newData: data ? Object.keys(data) : null,
+        });
+        return data;
+      });
+      
+      // Force a refetch to ensure we have the latest data from server
+      await queryClient.invalidateQueries({ 
+        queryKey: ["/api/sitemaps", activeCrawlId],
+        refetchType: 'active' 
+      });
+      
+      // Small delay to ensure cache update is processed
+      await new Promise(resolve => setTimeout(resolve, 200));
+      
+      await refetchSitemap();
+      
       toast({
         title: "AI Analysis Complete",
         description: "Your sitemap has been analyzed and improved",
@@ -261,23 +287,115 @@ export default function Home() {
     }
   }, [sitemap]);
 
+  // Helper function to recursively add IDs to all nodes in the tree
+  const addIdsToSitemap = (node: any, parentIndex: number = 0, depth: number = 0): any => {
+    if (!node) return node;
+    
+    // Generate id if missing
+    if (!node.id) {
+      if (node.url) {
+        // Use URL to generate a stable ID
+        node.id = `node-${node.url.replace(/[^a-zA-Z0-9]/g, '-').substring(0, 50)}`;
+      } else {
+        // Fallback to index-based ID
+        node.id = `node-${depth}-${parentIndex}`;
+      }
+    }
+    
+    // Recursively process children
+    if (node.children && Array.isArray(node.children)) {
+      node.children = node.children.map((child: any, index: number) => 
+        addIdsToSitemap(child, index, depth + 1)
+      );
+    }
+    
+    return node;
+  };
+
   // Extract sitemap data - handle both originalJson and direct sitemap object
   // The sitemap might have originalJson as a nested object or the sitemap itself might be the data
-  const originalSitemap = (sitemap?.originalJson || (sitemap as any)?.sitemap) as SitemapNode | undefined;
-  const improvedSitemap = sitemap?.improvedJson as SitemapNode | undefined;
+  const parseSitemapData = (data: any): SitemapNode | undefined => {
+    if (!data) {
+      console.log("[Home] parseSitemapData: no data provided");
+      return undefined;
+    }
+    // If it's a string, try to parse it
+    if (typeof data === 'string') {
+      try {
+        const parsed = JSON.parse(data);
+        if (parsed.url) {
+          const withIds = addIdsToSitemap(parsed);
+          console.log("[Home] parseSitemapData: parsed string, has id/url:", !!withIds?.id, !!withIds?.url);
+          return withIds as SitemapNode;
+        }
+      } catch (error) {
+        console.error("[Home] parseSitemapData: failed to parse string:", error);
+        return undefined;
+      }
+    }
+    // If it's already an object, validate it has required fields
+    if (typeof data === 'object') {
+      // URL is required, but id can be generated if missing
+      if (data.url) {
+        // Make a copy to avoid mutating the original
+        const dataCopy = JSON.parse(JSON.stringify(data));
+        const withIds = addIdsToSitemap(dataCopy);
+        console.log("[Home] parseSitemapData: valid object with url (id generated if needed):", {
+          hasId: !!withIds.id,
+          hasUrl: !!withIds.url,
+          hasChildren: !!(withIds.children && withIds.children.length > 0),
+        });
+        return withIds as SitemapNode;
+      } else {
+        console.warn("[Home] parseSitemapData: object missing url:", {
+          hasId: !!data.id,
+          hasUrl: !!data.url,
+          keys: Object.keys(data),
+        });
+      }
+    }
+    return undefined;
+  };
+
+  const originalSitemap = parseSitemapData(sitemap?.originalJson || (sitemap as any)?.sitemap);
+  const improvedSitemap = parseSitemapData(sitemap?.improvedJson);
   const aiExplanation = sitemap?.aiExplanation;
+  
+  // Log the actual values for debugging
+  useEffect(() => {
+    if (sitemap) {
+      console.log("[Home] 🔍 Detailed sitemap data:", {
+        isImproved: sitemap.isImproved,
+        hasImprovedJson: !!sitemap.improvedJson,
+        improvedJsonValue: sitemap.improvedJson ? (typeof sitemap.improvedJson === 'string' ? sitemap.improvedJson.substring(0, 100) : JSON.stringify(sitemap.improvedJson).substring(0, 100)) : null,
+        improvedJsonType: typeof sitemap.improvedJson,
+        hasAiExplanation: !!sitemap.aiExplanation,
+        aiExplanationValue: sitemap.aiExplanation ? sitemap.aiExplanation.substring(0, 100) : null,
+        parsedImprovedSitemap: improvedSitemap ? {
+          hasId: !!improvedSitemap.id,
+          hasUrl: !!improvedSitemap.url,
+          hasChildren: !!(improvedSitemap.children && improvedSitemap.children.length > 0),
+        } : null,
+      });
+    }
+  }, [sitemap, improvedSitemap]);
 
   // Debug logging for sitemap extraction
   useEffect(() => {
     console.log("[Home] Sitemap extraction:", {
       hasSitemap: !!sitemap,
+      isImproved: sitemap?.isImproved,
       hasOriginalSitemap: !!originalSitemap,
       hasImprovedSitemap: !!improvedSitemap,
+      hasAiExplanation: !!aiExplanation,
+      improvedJsonType: typeof sitemap?.improvedJson,
+      improvedJsonIsString: typeof sitemap?.improvedJson === 'string',
+      improvedJsonLength: sitemap?.improvedJson ? (typeof sitemap.improvedJson === 'string' ? sitemap.improvedJson.length : JSON.stringify(sitemap.improvedJson).length) : 0,
       sitemapLoading,
       viewState,
       crawlStatus: crawl?.status,
     });
-  }, [sitemap, originalSitemap, improvedSitemap, sitemapLoading, viewState, crawl?.status]);
+  }, [sitemap, originalSitemap, improvedSitemap, aiExplanation, sitemapLoading, viewState, crawl?.status]);
 
   return (
     <div className="min-h-screen bg-background">
@@ -398,10 +516,13 @@ export default function Home() {
               duplicatePages={crawl?.duplicatePages || 0}
             />
 
-            {sitemap?.isImproved && improvedSitemap && aiExplanation && (
+            {sitemap?.isImproved && improvedSitemap && aiExplanation ? (
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
                 <div className="lg:col-span-2">
-                  <ComparisonView original={originalSitemap} improved={improvedSitemap} />
+                  <ComparisonView 
+                    original={originalSitemap || improvedSitemap} 
+                    improved={improvedSitemap} 
+                  />
                 </div>
                 <AiInsightsPanel 
                   improvement={{
@@ -411,9 +532,24 @@ export default function Home() {
                   }}
                 />
               </div>
-            )}
-
-            {!sitemap?.isImproved && (
+            ) : sitemap?.isImproved && (!improvedSitemap || !aiExplanation) ? (
+              <Card>
+                <CardContent className="py-8">
+                  <div className="text-center text-muted-foreground">
+                    <p className="text-sm">Improved sitemap is being processed...</p>
+                    <Button 
+                      onClick={() => refetchSitemap()} 
+                      variant="outline" 
+                      className="mt-4"
+                      disabled={sitemapLoading}
+                    >
+                      <RefreshCw className={`mr-2 h-4 w-4 ${sitemapLoading ? 'animate-spin' : ''}`} />
+                      {sitemapLoading ? 'Refreshing...' : 'Refresh'}
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            ) : !sitemap?.isImproved ? (
               <Card>
                 <CardHeader>
                   <div className="flex items-center justify-between gap-4">
@@ -465,7 +601,7 @@ export default function Home() {
                   </Tabs>
                 </CardContent>
               </Card>
-            )}
+            ) : null}
               </div>
             ) : null}
           </>

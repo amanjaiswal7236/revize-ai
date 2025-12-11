@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useEffect } from "react";
+import { useMemo, useEffect } from "react";
 import ReactFlow, {
   Node,
   Edge,
@@ -10,6 +10,8 @@ import ReactFlow, {
   MarkerType,
   Position,
   ReactFlowProvider,
+  useReactFlow,
+  Handle,
 } from "reactflow";
 import "reactflow/dist/style.css";
 import { Badge } from "@/components/ui/badge";
@@ -21,9 +23,17 @@ interface SitemapTreeProps {
 }
 
 const nodeWidth = 220;
-const nodeHeight = 60;
-const horizontalSpacing = 280;
-const verticalSpacing = 100;
+const nodeHeight = 80;
+const horizontalSpacing = 50; // Spacing between sibling nodes
+const verticalSpacing = 120; // Spacing between levels
+
+interface TreeNodeLayout {
+  node: SitemapNode;
+  x: number;
+  y: number;
+  width: number;
+  children: TreeNodeLayout[];
+}
 
 function CustomNode({ data }: { data: { label: string; url: string; status?: string; depth: number } }) {
   const statusColors = {
@@ -33,7 +43,20 @@ function CustomNode({ data }: { data: { label: string; url: string; status?: str
   };
 
   return (
-    <div className="px-4 py-3 rounded-md border bg-card shadow-sm min-w-[200px] max-w-[260px]">
+    <div className="px-4 py-3 rounded-md border bg-card shadow-sm min-w-[200px] max-w-[260px] relative">
+      {/* Top handle for incoming connections */}
+      <Handle
+        type="target"
+        position={Position.Top}
+        id="top"
+        style={{ 
+          background: "hsl(var(--primary))",
+          border: "2px solid hsl(var(--background))",
+          width: "10px",
+          height: "10px",
+        }}
+      />
+      
       <div className="flex items-start justify-between gap-2">
         <div className="flex-1 min-w-0">
           <p className="text-sm font-medium truncate" title={data.label}>
@@ -49,88 +72,173 @@ function CustomNode({ data }: { data: { label: string; url: string; status?: str
           </Badge>
         )}
       </div>
+      
+      {/* Bottom handle for outgoing connections */}
+      <Handle
+        type="source"
+        position={Position.Bottom}
+        id="bottom"
+        style={{ 
+          background: "hsl(var(--primary))",
+          border: "2px solid hsl(var(--background))",
+          width: "10px",
+          height: "10px",
+        }}
+      />
     </div>
   );
 }
 
 const nodeTypes = { custom: CustomNode };
 
-function calculateTreeWidth(node: SitemapNode): number {
+/**
+ * Calculate the width needed for a subtree
+ * Returns the total width including the node and all its descendants
+ */
+function calculateSubtreeWidth(node: SitemapNode): number {
   const children = node.children || [];
+  
   if (children.length === 0) {
-    return nodeWidth + horizontalSpacing;
+    // Leaf node: just needs its own width
+    return nodeWidth;
   }
   
-  let totalWidth = 0;
-  children.forEach((child) => {
-    totalWidth += calculateTreeWidth(child);
+  // Calculate total width of all children
+  let childrenWidth = 0;
+  children.forEach((child, index) => {
+    const childWidth = calculateSubtreeWidth(child);
+    childrenWidth += childWidth;
+    // Add spacing between siblings (except for the last one)
+    if (index < children.length - 1) {
+      childrenWidth += horizontalSpacing;
+    }
   });
   
-  return totalWidth;
+  // Return the maximum of node width and children width
+  return Math.max(nodeWidth, childrenWidth);
 }
 
-function flattenTree(
+/**
+ * Build a hierarchical layout for the tree
+ * This creates a proper tree structure with correct positioning
+ */
+function buildTreeLayout(
   node: SitemapNode,
-  parentId: string | null,
   depth: number,
-  xOffset: number,
+  xOffset: number
+): TreeNodeLayout {
+  const children = node.children || [];
+  
+  if (children.length === 0) {
+    // Leaf node: positioned at xOffset
+    return {
+      node,
+      x: xOffset,
+      y: depth * verticalSpacing,
+      width: nodeWidth,
+      children: [],
+    };
+  }
+  
+  // First, calculate widths for all children
+  const childWidths = children.map(child => calculateSubtreeWidth(child));
+  
+  // Calculate total width needed for all children (including spacing)
+  const totalChildrenWidth = childWidths.reduce((sum, width, index) => {
+    return sum + width + (index < childWidths.length - 1 ? horizontalSpacing : 0);
+  }, 0);
+  
+  // Process children and position them with proper spacing
+  const childLayouts: TreeNodeLayout[] = [];
+  let currentX = xOffset;
+  
+  children.forEach((child, index) => {
+    const childLayout = buildTreeLayout(child, depth + 1, currentX);
+    childLayouts.push(childLayout);
+    // Move to next position: current child's end position + spacing
+    currentX = childLayout.x + childLayout.width;
+    if (index < children.length - 1) {
+      currentX += horizontalSpacing;
+    }
+  });
+  
+  // Calculate the actual span of children (from first child's left to last child's right)
+  const firstChildX = childLayouts[0].x;
+  const lastChildX = childLayouts[childLayouts.length - 1].x;
+  const lastChildRight = lastChildX + childLayouts[childLayouts.length - 1].width;
+  const childrenSpan = lastChildRight - firstChildX;
+  
+  // Center the parent node over its children
+  const childrenCenterX = firstChildX + childrenSpan / 2;
+  const nodeX = childrenCenterX - nodeWidth / 2;
+  
+  // The total width of this subtree is the max of node width and children span
+  const subtreeWidth = Math.max(nodeWidth, childrenSpan);
+  
+  return {
+    node,
+    x: nodeX,
+    y: depth * verticalSpacing,
+    width: subtreeWidth,
+    children: childLayouts,
+  };
+}
+
+/**
+ * Convert tree layout to ReactFlow nodes and edges
+ */
+function layoutToReactFlow(
+  layout: TreeNodeLayout,
+  parentId: string | null,
   nodes: Node[],
   edges: Edge[]
 ): void {
-  const nodeId = node.id;
-  const children = node.children || [];
+  const nodeId = layout.node.id;
   
-  // Calculate widths of all children first
-  const childWidths: number[] = [];
-  let totalWidth = 0;
-  
-  children.forEach((child) => {
-    const width = calculateTreeWidth(child);
-    childWidths.push(width);
-    totalWidth += width;
-  });
-  
-  // If no children, use default width
-  if (children.length === 0) {
-    totalWidth = nodeWidth + horizontalSpacing;
-  }
-
-  // Calculate x position for this node (centered over its children)
-  const x = xOffset + totalWidth / 2 - nodeWidth / 2;
-  const y = depth * verticalSpacing;
-
-  // Add this node to the nodes array
+  // Add this node with explicit dimensions
   nodes.push({
     id: nodeId,
     type: "custom",
-    position: { x, y },
+    position: { x: layout.x, y: layout.y },
     data: {
-      label: node.title || node.url,
-      url: node.url,
-      status: node.status,
-      depth: node.depth,
+      label: layout.node.title || layout.node.url,
+      url: layout.node.url,
+      status: layout.node.status,
+      depth: layout.node.depth,
     },
+    width: nodeWidth,
+    height: nodeHeight,
     sourcePosition: Position.Bottom,
     targetPosition: Position.Top,
   });
-
-  // Add edge from parent to this node
+  
+  // Add edge from parent to this node with explicit handles
   if (parentId) {
     edges.push({
       id: `${parentId}-${nodeId}`,
       source: parentId,
       target: nodeId,
+      sourceHandle: "bottom",
+      targetHandle: "top",
       type: "smoothstep",
-      markerEnd: { type: MarkerType.ArrowClosed, width: 15, height: 15 },
-      style: { stroke: "hsl(var(--muted-foreground))", strokeWidth: 1.5 },
+      animated: false,
+      markerEnd: { 
+        type: MarkerType.ArrowClosed, 
+        width: 20, 
+        height: 20,
+        color: "hsl(var(--muted-foreground))"
+      },
+      style: { 
+        stroke: "hsl(var(--muted-foreground))", 
+        strokeWidth: 2,
+        strokeOpacity: 0.8
+      },
     });
   }
-
-  // Recursively process children
-  let childXOffset = xOffset;
-  children.forEach((child, index) => {
-    flattenTree(child, nodeId, depth + 1, childXOffset, nodes, edges);
-    childXOffset += childWidths[index] || 0;
+  
+  // Process children
+  layout.children.forEach((childLayout) => {
+    layoutToReactFlow(childLayout, nodeId, nodes, edges);
   });
 }
 
@@ -151,7 +259,24 @@ export function SitemapTree({ data, className }: SitemapTreeProps) {
     const edges: Edge[] = [];
     
     try {
-      flattenTree(data, null, 0, 0, nodes, edges);
+      // Build tree layout
+      const treeLayout = buildTreeLayout(data, 0, 0);
+      
+      // Convert layout to ReactFlow nodes and edges
+      layoutToReactFlow(treeLayout, null, nodes, edges);
+      
+      // Center the entire tree horizontally (optional - fitView will handle centering)
+      // We just ensure it starts from a reasonable position
+      if (nodes.length > 0) {
+        const minX = Math.min(...nodes.map(n => n.position.x));
+        // Shift so the leftmost node is at x=0 (fitView will center it in the viewport)
+        const offsetX = -minX;
+        
+        nodes.forEach(node => {
+          node.position.x += offsetX;
+        });
+      }
+      
       console.log("[SitemapTree] ✅ Generated tree:", { 
         nodeCount: nodes.length, 
         edgeCount: edges.length,
@@ -195,29 +320,65 @@ export function SitemapTree({ data, className }: SitemapTreeProps) {
   }
 
   return (
-    <div className={`w-full h-full min-h-[500px] rounded-md border bg-background ${className || ""}`}>
+    <div className={`w-full rounded-md border bg-background overflow-hidden ${className || "h-[600px]"}`}>
       <ReactFlowProvider>
-        <ReactFlow
+        <SitemapTreeInner 
           nodes={nodes}
           edges={edges}
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           nodeTypes={nodeTypes}
-          fitView
-          fitViewOptions={{ padding: 0.2 }}
-          minZoom={0.1}
-          maxZoom={2}
-          proOptions={{ hideAttribution: true }}
-        >
-          <Background gap={16} size={1} />
-          <Controls showInteractive={false} />
-          <MiniMap
-            nodeColor="hsl(var(--primary))"
-            maskColor="hsl(var(--background) / 0.8)"
-            className="!bg-card border rounded-md"
-          />
-        </ReactFlow>
+        />
       </ReactFlowProvider>
+    </div>
+  );
+}
+
+function SitemapTreeInner({ 
+  nodes, 
+  edges, 
+  onNodesChange, 
+  onEdgesChange, 
+  nodeTypes 
+}: { 
+  nodes: Node[]; 
+  edges: Edge[]; 
+  onNodesChange: any; 
+  onEdgesChange: any; 
+  nodeTypes: any;
+}) {
+  const { fitView } = useReactFlow();
+  
+  useEffect(() => {
+    // Fit view after nodes are rendered
+    const timer = setTimeout(() => {
+      fitView({ padding: 0.2, duration: 300 });
+    }, 100);
+    return () => clearTimeout(timer);
+  }, [nodes, edges, fitView]);
+
+  return (
+    <div className="w-full h-full">
+      <ReactFlow
+        nodes={nodes}
+        edges={edges}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        nodeTypes={nodeTypes}
+        fitView
+        fitViewOptions={{ padding: 0.2 }}
+        minZoom={0.1}
+        maxZoom={2}
+        proOptions={{ hideAttribution: true }}
+      >
+        <Background gap={16} size={1} />
+        <Controls showInteractive={false} />
+        <MiniMap
+          nodeColor="hsl(var(--primary))"
+          maskColor="hsl(var(--background) / 0.8)"
+          className="!bg-card border rounded-md"
+        />
+      </ReactFlow>
     </div>
   );
 }
