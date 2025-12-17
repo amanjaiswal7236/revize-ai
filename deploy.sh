@@ -39,7 +39,16 @@ echo -e "${GREEN}✓ Node.js version: $(node -v)${NC}"
 # Install PM2 globally if not installed
 if ! command -v pm2 &> /dev/null; then
     echo "📦 Installing PM2..."
-    npm install -g pm2
+    # Use sudo for global installation (required on most systems)
+    sudo npm install -g pm2 || {
+        echo -e "${YELLOW}⚠️  Failed to install PM2 with sudo${NC}"
+        echo "   Trying without sudo (if npm prefix is in home directory)..."
+        npm install -g pm2 || {
+            echo -e "${YELLOW}⚠️  Could not install PM2${NC}"
+            echo "   Please install manually: sudo npm install -g pm2"
+            exit 1
+        }
+    }
     echo -e "${GREEN}✓ PM2 installed${NC}"
 else
     echo -e "${GREEN}✓ PM2 already installed${NC}"
