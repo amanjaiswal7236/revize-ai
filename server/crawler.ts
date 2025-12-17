@@ -66,6 +66,91 @@ function getErrorMessage(error: any): string {
   return error.toString() || "Unknown error";
 }
 
+// Safe page evaluation wrapper that handles execution context destruction
+async function safeEvaluate<T>(
+  page: Page,
+  fn: () => T | Promise<T>,
+  fallback?: T,
+  retries?: number
+): Promise<T | null>;
+async function safeEvaluate<T, P>(
+  page: Page,
+  fn: (param: P) => T | Promise<T>,
+  param: P,
+  fallback?: T,
+  retries?: number
+): Promise<T | null>;
+async function safeEvaluate<T, P = void>(
+  page: Page,
+  fn: (() => T | Promise<T>) | ((param: P) => T | Promise<T>),
+  paramOrFallback?: P | T,
+  fallbackOrRetries?: T | number,
+  retries?: number
+): Promise<T | null> {
+  // Determine which overload was called
+  // If the second arg is a function parameter (not a fallback), it's the param overload
+  const isParamOverload = paramOrFallback !== undefined && 
+    (typeof paramOrFallback === 'string' || typeof paramOrFallback === 'number' || 
+     (typeof paramOrFallback === 'object' && paramOrFallback !== null && !Array.isArray(paramOrFallback)));
+  
+  const param = isParamOverload ? (paramOrFallback as P) : undefined;
+  const fallback = isParamOverload ? (fallbackOrRetries as T | undefined) : (paramOrFallback as T | undefined);
+  const maxRetries = isParamOverload ? (retries ?? 2) : (typeof fallbackOrRetries === 'number' ? fallbackOrRetries : 2);
+  
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      // Check if page is closed
+      if (page.isClosed()) {
+        log(`  ⚠ Page is closed, cannot evaluate`);
+        return fallback ?? null;
+      }
+
+      // Wait a bit to ensure navigation has settled
+      // Always wait before first attempt to ensure page is stable
+      await new Promise(resolve => setTimeout(resolve, 500 + (attempt * 300)));
+
+      // Try to evaluate with timeout
+      const evaluatePromise = param !== undefined 
+        ? page.evaluate(fn as any, param)
+        : page.evaluate(fn as any);
+      
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error("Evaluation timeout")), 5000);
+      });
+      
+      const result = await Promise.race([evaluatePromise, timeoutPromise]);
+      return result;
+    } catch (error: any) {
+      const errorMsg = error.message || error.toString();
+      
+      // Check for execution context errors
+      if (
+        errorMsg.includes("execution context destroyed") ||
+        errorMsg.includes("Target closed") ||
+        errorMsg.includes("Session closed") ||
+        errorMsg.includes("Protocol error") ||
+        errorMsg.includes("Navigation") ||
+        errorMsg.includes("Execution context") ||
+        errorMsg.includes("Evaluation timeout") ||
+        error.name === "ProtocolError" ||
+        error.name === "TargetClosedError"
+      ) {
+        if (attempt < maxRetries) {
+          // Wait longer between retries
+          await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
+          continue;
+        } else {
+          return fallback ?? null;
+        }
+      }
+      
+      // For other errors, throw them
+      throw error;
+    }
+  }
+  return fallback ?? null;
+}
+
 async function getRobotsRules(baseUrl: string): Promise<any> {
   try {
     const robotsUrl = new URL("/robots.txt", baseUrl).href;
@@ -156,12 +241,23 @@ async function extractLinks(page: Page, baseUrl: string): Promise<string[]> {
   const links: string[] = [];
   
   // Get the actual current URL from the page (may have changed due to hash routing)
-  const currentPageUrl = page.url();
+  let currentPageUrl: string;
+  try {
+    if (page.isClosed()) {
+      currentPageUrl = baseUrl;
+    } else {
+      currentPageUrl = page.url();
+    }
+  } catch (error: any) {
+    // If we can't get the URL, use the base URL
+    log(`  ⚠ Could not get page URL: ${error.message}`);
+    currentPageUrl = baseUrl;
+  }
   const effectiveBaseUrl = currentPageUrl || baseUrl;
   
   // Wait a moment for any dynamically added links to appear
   // Also trigger any lazy-loaded navigation menus
-  await page.evaluate(() => {
+  await safeEvaluate(page, () => {
     // Try to expand any collapsed navigation menus
     const navToggles = document.querySelectorAll("[aria-expanded='false'], [class*='collapsed'], [class*='menu-toggle']");
     navToggles.forEach((toggle) => {
@@ -175,7 +271,7 @@ async function extractLinks(page: Page, baseUrl: string): Promise<string[]> {
   await new Promise(resolve => setTimeout(resolve, 500));
   
   // Extract links from <a> tags using browser DOM
-  const anchorLinks = await page.evaluate((base: string) => {
+  const anchorLinks = await safeEvaluate<string[], string>(page, (base: string) => {
     const links: string[] = [];
     const anchors = document.querySelectorAll("a[href]");
     anchors.forEach((anchor) => {
@@ -274,12 +370,12 @@ async function extractLinks(page: Page, baseUrl: string): Promise<string[]> {
     });
     
     return links;
-  }, effectiveBaseUrl);
+  }, effectiveBaseUrl, []) || [];
   
   links.push(...anchorLinks);
   
   // Extract links from <area> tags (image maps)
-  const areaLinks = await page.evaluate((base: string) => {
+  const areaLinks = await safeEvaluate<string[], string>(page, (base: string) => {
     const links: string[] = [];
     const areas = document.querySelectorAll("area[href]");
     areas.forEach((area) => {
@@ -318,12 +414,12 @@ async function extractLinks(page: Page, baseUrl: string): Promise<string[]> {
     }
   });
     return links;
-  }, effectiveBaseUrl);
+  }, effectiveBaseUrl, []) || [];
   
   links.push(...areaLinks);
   
   // Extract canonical links
-  const canonicalLinks = await page.evaluate((base: string) => {
+  const canonicalLinks = await safeEvaluate<string[], string>(page, (base: string) => {
     const links: string[] = [];
     const canonical = document.querySelector("link[rel='canonical'][href]");
     if (canonical) {
@@ -338,7 +434,7 @@ async function extractLinks(page: Page, baseUrl: string): Promise<string[]> {
       }
     }
     return links;
-  }, effectiveBaseUrl);
+  }, effectiveBaseUrl, []) || [];
   
   links.push(...canonicalLinks);
   
@@ -365,13 +461,13 @@ async function extractLinks(page: Page, baseUrl: string): Promise<string[]> {
 }
 
 async function extractTitle(page: Page): Promise<string> {
-  const title = await page.evaluate(() => {
+  const title = await safeEvaluate(page, () => {
     const titleEl = document.querySelector("title");
     const h1El = document.querySelector("h1");
     const title = titleEl?.textContent?.trim() || "";
     const h1 = h1El?.textContent?.trim() || "";
   return title || h1 || "Untitled";
-  });
+  }, undefined, "Untitled") || "Untitled";
   return title;
 }
 
@@ -392,6 +488,56 @@ async function crawlPage(
     await page.setUserAgent(USER_AGENT);
     await page.setViewport({ width: 1920, height: 1080 });
     
+    // Track navigation state to prevent evaluation during navigation
+    let navigationInProgress = false;
+    let navigationPromise: Promise<void> | null = null;
+    let navigationResolve: (() => void) | null = null;
+    let navigationTimeout: NodeJS.Timeout | null = null;
+    
+    // Listen for navigation start
+    page.on("request", (request: any) => {
+      if (request.isNavigationRequest()) {
+        navigationInProgress = true;
+      }
+    });
+    
+    // Listen for navigation events
+    page.on("framenavigated", () => {
+      navigationInProgress = true;
+      // Clear any existing timeout
+      if (navigationTimeout) {
+        clearTimeout(navigationTimeout);
+      }
+      // Set a timeout to mark navigation as complete
+      navigationTimeout = setTimeout(() => {
+        navigationInProgress = false;
+        if (navigationResolve) {
+          navigationResolve();
+          navigationResolve = null;
+        }
+      }, 500);
+    });
+    
+    // Wait for navigation to fully complete
+    const waitForNavigationComplete = async (timeout = 3000) => {
+      if (navigationInProgress) {
+        return new Promise<void>((resolve) => {
+          const startTime = Date.now();
+          const checkNavigation = () => {
+            if (!navigationInProgress || Date.now() - startTime > timeout) {
+              navigationInProgress = false;
+              resolve();
+            } else {
+              setTimeout(checkNavigation, 100);
+            }
+          };
+          checkNavigation();
+        });
+      }
+      // Small delay to ensure DOM is stable
+      await new Promise(resolve => setTimeout(resolve, 200));
+    };
+    
     // Track network requests to wait for API calls to complete
     let pendingRequests = 0;
     let networkIdlePromise: Promise<void> | null = null;
@@ -403,33 +549,55 @@ async function crawlPage(
     
     // Set up network request tracking and interception
     page.on("request", (request: any) => {
-      const resourceType = request.resourceType();
-      
-      // Track XHR and fetch requests (API calls)
-      if (resourceType === "xhr" || resourceType === "fetch") {
-        pendingRequests++;
-        log(`  📡 API request started (${pendingRequests} pending): ${request.url().substring(0, 80)}`);
-      }
-      
-      // Block images, fonts, and media for faster crawling
-      // Keep stylesheets, scripts, and xhr/fetch requests for SPAs
-      if (["image", "font", "media"].includes(resourceType)) {
-        request.abort();
-      } else {
-        request.continue();
+      try {
+        if (!page || page.isClosed()) return;
+        const resourceType = request.resourceType();
+        
+        // Track XHR and fetch requests (API calls)
+        if (resourceType === "xhr" || resourceType === "fetch") {
+          pendingRequests++;
+          try {
+            log(`  📡 API request started (${pendingRequests} pending): ${request.url().substring(0, 80)}`);
+          } catch {
+            // Ignore errors getting URL
+          }
+        }
+        
+        // Block images, fonts, and media for faster crawling
+        // Keep stylesheets, scripts, and xhr/fetch requests for SPAs
+        if (["image", "font", "media"].includes(resourceType)) {
+          request.abort().catch(() => {
+            // Ignore abort errors
+          });
+        } else {
+          request.continue().catch(() => {
+            // Ignore continue errors (page might be closed)
+          });
+        }
+      } catch (error: any) {
+        // Ignore errors in request handler (page might be closed)
+        if (!error.message?.includes("Target closed") && 
+            !error.message?.includes("execution context destroyed")) {
+          // Log unexpected errors
+        }
       }
     });
     
     page.on("response", (response: any) => {
-      const resourceType = response.request().resourceType();
-      // Track completion of API calls
-      if (resourceType === "xhr" || resourceType === "fetch") {
-        pendingRequests = Math.max(0, pendingRequests - 1);
-        if (pendingRequests === 0 && networkIdleResolve) {
-          log(`  ✅ All API requests completed`);
-          networkIdleResolve();
-          networkIdleResolve = null;
+      try {
+        if (!page || page.isClosed()) return;
+        const resourceType = response.request().resourceType();
+        // Track completion of API calls
+        if (resourceType === "xhr" || resourceType === "fetch") {
+          pendingRequests = Math.max(0, pendingRequests - 1);
+          if (pendingRequests === 0 && networkIdleResolve) {
+            log(`  ✅ All API requests completed`);
+            networkIdleResolve();
+            networkIdleResolve = null;
+          }
         }
+      } catch (error: any) {
+        // Ignore errors in response handler
       }
     });
     
@@ -446,56 +614,106 @@ async function crawlPage(
       log(`  ↪ Hash route detected, navigating to base first: ${baseUrl}`);
       
       // Navigate to base URL first - use faster loading strategy
-      response = await page.goto(baseUrl, {
-        waitUntil: "domcontentloaded", // Faster than networkidle2
-        timeout: DEFAULT_TIMEOUT,
-      });
-      
-      if (!response) {
-        throw new Error("No response received");
+      try {
+        response = await page.goto(baseUrl, {
+          waitUntil: "domcontentloaded", // Faster than networkidle2
+          timeout: DEFAULT_TIMEOUT,
+        });
+        
+        if (!response) {
+          throw new Error("No response received");
+        }
+      } catch (error: any) {
+        // If navigation fails due to context destruction, try to recover
+        if (error.message?.includes("execution context destroyed") || 
+            error.message?.includes("Target closed") ||
+            error.message?.includes("Navigation")) {
+          log(`  ⚠ Navigation error, attempting to recover...`);
+          // Try to get a new page if the old one is closed
+          if (page.isClosed()) {
+            page = await browser.newPage();
+            await page.setUserAgent(USER_AGENT);
+            await page.setViewport({ width: 1920, height: 1080 });
+            response = await page.goto(baseUrl, {
+              waitUntil: "domcontentloaded",
+              timeout: DEFAULT_TIMEOUT,
+            });
+          } else {
+            throw error;
+          }
+        } else {
+          throw error;
+        }
       }
+      
+      // Wait for navigation to fully complete after initial load
+      await waitForNavigationComplete(2000);
       
       // Wait for initial page load
       await new Promise(resolve => setTimeout(resolve, 1000));
       
       // Now set the hash to trigger the route
       log(`  ↪ Setting hash route: ${urlObj.hash}`);
-      await page.evaluate((hash) => {
-        window.location.hash = hash;
-      }, urlObj.hash);
+      try {
+        // Ensure navigation is stable before setting hash
+        await waitForNavigationComplete(1000);
+        await safeEvaluate<void, string>(page, (hash: string) => {
+          window.location.hash = hash;
+        }, urlObj.hash);
+      } catch (error: any) {
+        log(`  ⚠ Error setting hash: ${error.message}`);
+      }
       
       // Wait for hashchange event and route to load
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      
+      // Wait for any navigation to complete after hash change
+      await waitForNavigationComplete(3000);
       
       // Wait for route content to render
       try {
         // Wait for DOM to update and content to appear
-        await page.waitForFunction(
-          () => {
-            const body = document.body;
-            if (!body) return false;
-            
-            // Check for loading indicators disappearing
-            const loadingIndicators = body.querySelectorAll("[class*='loading'], [class*='spinner'], [id*='loading'], [class*='skeleton'], [class*='loader']");
-            const hasLoading = Array.from(loadingIndicators).some(el => {
-              const style = window.getComputedStyle(el);
-              return style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
-            });
-            
-            // Check for meaningful content
-            const text = body.innerText || body.textContent || "";
-            const hasContent = text.length > 100 || 
-                              body.querySelector("main, article, [role='main'], .content, .app-content") ||
-                              body.querySelectorAll("a[href]").length > 3 ||
-                              body.querySelectorAll("nav a, .nav a, [role='navigation'] a").length > 0;
-            
-            return !hasLoading && (hasContent || document.readyState === "complete");
-          },
-          { timeout: CONTENT_CHECK_TIMEOUT }
-        );
-      } catch {
+        if (!page.isClosed()) {
+          await page.waitForFunction(
+            () => {
+              const body = document.body;
+              if (!body) return false;
+              
+              // Check for loading indicators disappearing
+              const loadingIndicators = body.querySelectorAll("[class*='loading'], [class*='spinner'], [id*='loading'], [class*='skeleton'], [class*='loader']");
+              const hasLoading = Array.from(loadingIndicators).some(el => {
+                const style = window.getComputedStyle(el);
+                return style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
+              });
+              
+              // Check for meaningful content
+              const text = body.innerText || body.textContent || "";
+              const hasContent = text.length > 100 || 
+                                body.querySelector("main, article, [role='main'], .content, .app-content") ||
+                                body.querySelectorAll("a[href]").length > 3 ||
+                                body.querySelectorAll("nav a, .nav a, [role='navigation'] a").length > 0;
+              
+              return !hasLoading && (hasContent || document.readyState === "complete");
+            },
+            { timeout: CONTENT_CHECK_TIMEOUT }
+          ).catch((error: any) => {
+            // Handle execution context errors
+            if (error.message?.includes("execution context destroyed") || 
+                error.message?.includes("Target closed") ||
+                error.message?.includes("Navigation")) {
+              log(`  ⚠ Execution context destroyed during wait, continuing...`);
+            } else {
+              log(`  ⚠ Timeout waiting for content, continuing anyway...`);
+            }
+          });
+        }
+      } catch (error: any) {
         // Continue even if timeout - some pages might load differently
-        log(`  ⚠ Timeout waiting for content, continuing anyway...`);
+        if (error.message?.includes("execution context destroyed")) {
+          log(`  ⚠ Execution context destroyed, continuing...`);
+        } else {
+          log(`  ⚠ Error waiting for content, continuing anyway...`);
+        }
       }
       
       // Wait for network requests to complete
@@ -518,7 +736,7 @@ async function crawlPage(
       // Reduced scroll actions to trigger lazy loading (only 2 positions instead of 5)
       const scrollPositions = [0.5, 1.0];
       for (const position of scrollPositions) {
-        await page.evaluate((pos) => {
+        await safeEvaluate<void, number>(page, (pos: number) => {
           window.scrollTo(0, document.body.scrollHeight * pos);
         }, position);
         await new Promise(resolve => setTimeout(resolve, 300));
@@ -528,14 +746,40 @@ async function crawlPage(
       await new Promise(resolve => setTimeout(resolve, 500));
     } else {
       // Normal navigation for non-hash URLs - use faster loading strategy
-      response = await page.goto(url, {
-        waitUntil: "domcontentloaded", // Faster than networkidle2
-        timeout: DEFAULT_TIMEOUT,
-      });
-      
-      if (!response) {
-        throw new Error("No response received");
+      try {
+        response = await page.goto(url, {
+          waitUntil: "domcontentloaded", // Faster than networkidle2
+          timeout: DEFAULT_TIMEOUT,
+        });
+        
+        if (!response) {
+          throw new Error("No response received");
+        }
+      } catch (error: any) {
+        // If navigation fails due to context destruction, try to recover
+        if (error.message?.includes("execution context destroyed") || 
+            error.message?.includes("Target closed") ||
+            error.message?.includes("Navigation")) {
+          log(`  ⚠ Navigation error, attempting to recover...`);
+          // Try to get a new page if the old one is closed
+          if (page.isClosed()) {
+            page = await browser.newPage();
+            await page.setUserAgent(USER_AGENT);
+            await page.setViewport({ width: 1920, height: 1080 });
+            response = await page.goto(url, {
+              waitUntil: "domcontentloaded",
+              timeout: DEFAULT_TIMEOUT,
+            });
+          } else {
+            throw error;
+          }
+        } else {
+          throw error;
+        }
       }
+      
+      // Wait for navigation to fully complete first
+      await waitForNavigationComplete(2000);
       
       // Wait for initial page load
       await new Promise(resolve => setTimeout(resolve, PAGE_LOAD_WAIT_TIME));
@@ -546,7 +790,7 @@ async function crawlPage(
       
       // Wait for DOM mutations to settle (indicates content has loaded)
       try {
-        await page.evaluate(() => {
+        await safeEvaluate(page, () => {
           return new Promise<void>((resolve) => {
             let lastMutationTime = Date.now();
             let timeoutId: any;
@@ -587,7 +831,7 @@ async function crawlPage(
       
       // For SPAs, wait for content to be rendered
       // Try to detect if it's an SPA by checking for common SPA indicators
-      const isSPA = await page.evaluate(() => {
+      const isSPA = await safeEvaluate(page, () => {
         // Check for common SPA frameworks
         const hasReact = !!(window as any).React || !!(window as any).__REACT_DEVTOOLS_GLOBAL_HOOK__;
         const hasVue = !!(window as any).Vue || !!(window as any).__VUE__;
@@ -597,7 +841,7 @@ async function crawlPage(
         const hasSinglePageApp = document.querySelector("[id*='app'], [id*='root'], [class*='app'], [class*='root']") && 
                                  document.querySelectorAll("a[href]").length < 10; // Few links might indicate SPA
         return hasReact || hasVue || hasAngular || !!hasRouter || !!hasSinglePageApp;
-      });
+      }, undefined, false) || false;
       
       // ALWAYS apply SPA waiting, even if not detected (better safe than sorry)
       if (true) { // Always apply SPA strategy
@@ -612,31 +856,46 @@ async function crawlPage(
         
         // Wait for meaningful content to appear - reduced to single check for speed
         try {
-          await page.waitForFunction(
-            () => {
-              const body = document.body;
-              if (!body) return false;
-              
-              // Check for loading indicators
-              const loadingIndicators = body.querySelectorAll("[class*='loading'], [class*='spinner'], [id*='loading'], [class*='skeleton'], [class*='loader']");
-              const hasLoading = Array.from(loadingIndicators).some(el => {
-                const style = window.getComputedStyle(el);
-                return style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
-              });
-              
-              // Check for common content indicators - be more lenient
-              const text = body.innerText || body.textContent || "";
-              const hasContent = body.querySelector("main, article, [role='main'], .content, .app-content, [id*='app'], [id*='root']") ||
-                                text.length > 50 || // Lower threshold
-                                body.querySelectorAll("a[href]").length > 0 || // Any links
-                                body.querySelectorAll("nav a, .nav a, [role='navigation'] a, header a, footer a").length > 0 ||
-                                body.querySelectorAll("button, [role='button']").length > 0; // Any interactive elements
-              return !hasLoading && hasContent && document.readyState === "complete";
-            },
-            { timeout: CONTENT_CHECK_TIMEOUT }
-          );
-        } catch {
-          log(`  ⚠ Timeout waiting for content, continuing anyway...`);
+          if (!page.isClosed()) {
+            await page.waitForFunction(
+              () => {
+                const body = document.body;
+                if (!body) return false;
+                
+                // Check for loading indicators
+                const loadingIndicators = body.querySelectorAll("[class*='loading'], [class*='spinner'], [id*='loading'], [class*='skeleton'], [class*='loader']");
+                const hasLoading = Array.from(loadingIndicators).some(el => {
+                  const style = window.getComputedStyle(el);
+                  return style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
+                });
+                
+                // Check for common content indicators - be more lenient
+                const text = body.innerText || body.textContent || "";
+                const hasContent = body.querySelector("main, article, [role='main'], .content, .app-content, [id*='app'], [id*='root']") ||
+                                  text.length > 50 || // Lower threshold
+                                  body.querySelectorAll("a[href]").length > 0 || // Any links
+                                  body.querySelectorAll("nav a, .nav a, [role='navigation'] a, header a, footer a").length > 0 ||
+                                  body.querySelectorAll("button, [role='button']").length > 0; // Any interactive elements
+                return !hasLoading && hasContent && document.readyState === "complete";
+              },
+              { timeout: CONTENT_CHECK_TIMEOUT }
+            ).catch((error: any) => {
+              // Handle execution context errors
+              if (error.message?.includes("execution context destroyed") || 
+                  error.message?.includes("Target closed") ||
+                  error.message?.includes("Navigation")) {
+                log(`  ⚠ Execution context destroyed during wait, continuing...`);
+              } else {
+                log(`  ⚠ Timeout waiting for content, continuing anyway...`);
+              }
+            });
+          }
+        } catch (error: any) {
+          if (error.message?.includes("execution context destroyed")) {
+            log(`  ⚠ Execution context destroyed, continuing...`);
+          } else {
+            log(`  ⚠ Timeout waiting for content, continuing anyway...`);
+          }
         }
         
         // Wait for network requests to complete
@@ -654,11 +913,11 @@ async function crawlPage(
         }
         
         // Reduced scroll operations for lazy loading (only 2 positions)
-        await page.evaluate(() => {
+        await safeEvaluate(page, () => {
           window.scrollTo(0, document.body.scrollHeight / 2);
         });
         await new Promise(resolve => setTimeout(resolve, 300));
-        await page.evaluate(() => {
+        await safeEvaluate(page, () => {
           window.scrollTo(0, 0);
         });
         await new Promise(resolve => setTimeout(resolve, 300));
@@ -701,17 +960,47 @@ async function crawlPage(
     }
     
     // Get the final URL after redirects and hash routing
-    const finalUrl = page.url();
+    let finalUrl: string;
+    try {
+      if (page.isClosed()) {
+        finalUrl = url; // Use original URL if page is closed
+      } else {
+        finalUrl = page.url();
+      }
+    } catch (error: any) {
+      // If we can't get the URL, use the original URL
+      log(`  ⚠ Could not get final URL: ${error.message}`);
+      finalUrl = url;
+    }
     
     // Verify hash route was set correctly
     if (hasHashRoute && !finalUrl.includes(urlObj.hash)) {
       log(`  ⚠ Hash route may not have loaded correctly. Expected: ${urlObj.hash}, Got: ${finalUrl}`);
       // Try to set it again
       try {
-        await page.evaluate((hash) => {
-          window.location.hash = hash;
-        }, urlObj.hash);
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        if (!page.isClosed()) {
+          await safeEvaluate<void, string>(page, (hash: string) => {
+            window.location.hash = hash;
+          }, urlObj.hash);
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          // Wait for navigation if it occurs
+          try {
+            await page.waitForNavigation({ timeout: 2000, waitUntil: "domcontentloaded" }).catch((error: any) => {
+              // Handle execution context errors gracefully
+              if (error.message?.includes("execution context destroyed") || 
+                  error.message?.includes("Target closed") ||
+                  error.message?.includes("Navigation")) {
+                log(`  ⚠ Navigation context destroyed, continuing...`);
+              }
+            });
+          } catch (error: any) {
+            // Ignore navigation timeout and context errors
+            if (!error.message?.includes("execution context destroyed") && 
+                !error.message?.includes("Target closed")) {
+              // Log other errors
+            }
+          }
+        }
       } catch {
         // Ignore errors
       }
@@ -719,7 +1008,7 @@ async function crawlPage(
     
     // Final check: ensure page has content before extracting
     // This is especially important for SPAs
-    const hasContent = await page.evaluate(() => {
+    const hasContent = await safeEvaluate(page, () => {
       const body = document.body;
       if (!body) return false;
       const text = body.innerText || body.textContent || "";
@@ -733,25 +1022,25 @@ async function crawlPage(
         return style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
       });
       return (text.length > 50 || links.length > 0 || !!hasMainContent) && !isLoading;
-    });
+    }, undefined, false) || false;
     
     if (!hasContent) {
       log(`  ⚠ Page appears to have no content or still loading, waiting for SPA to render...`);
       await new Promise(resolve => setTimeout(resolve, 2000));
       
       // Try scrolling to trigger lazy loading
-      await page.evaluate(() => {
+      await safeEvaluate(page, () => {
         window.scrollTo(0, document.body.scrollHeight);
       });
       await new Promise(resolve => setTimeout(resolve, 500));
-      await page.evaluate(() => {
+      await safeEvaluate(page, () => {
         window.scrollTo(0, 0);
       });
       await new Promise(resolve => setTimeout(resolve, 500));
       
       // Try clicking common navigation elements that might reveal content
       try {
-        await page.evaluate(() => {
+        await safeEvaluate(page, () => {
           // Try to find and click menu/nav buttons that might reveal links
           const menuButtons = document.querySelectorAll("button[aria-label*='menu'], button[aria-label*='Menu'], [class*='menu-toggle'], [class*='nav-toggle']");
           if (menuButtons.length > 0) {
@@ -778,15 +1067,57 @@ async function crawlPage(
       await networkIdlePromise;
     }
     
+    // Wait for navigation to fully complete before extraction
+    await waitForNavigationComplete(2000);
+    
     // Reduced wait for network to settle
     await new Promise(resolve => setTimeout(resolve, 500));
     
     // Reduced final wait for any dynamically added links
     await new Promise(resolve => setTimeout(resolve, 500));
     
+    // Check if page is still valid before extracting
+    if (!page || page.isClosed()) {
+      log(`  ⚠ Page is closed, cannot extract content`);
+      if (page) {
+        await page.close().catch(() => {});
+      }
+      return {
+        url: finalUrl || url,
+        title: "Error: Page closed",
+        status: "broken",
+        depth: 0,
+        links: [],
+      };
+    }
+    
     // Extract title and links from the rendered page
-    const title = await extractTitle(page);
-    const links = await extractLinks(page, finalUrl);
+    let title: string;
+    let links: string[];
+    try {
+      // Wait one more time to ensure everything is stable
+      await waitForNavigationComplete(1000);
+      title = await extractTitle(page);
+      await waitForNavigationComplete(1000);
+      links = await extractLinks(page, finalUrl);
+    } catch (error: any) {
+      // If extraction fails due to context destruction, return error info
+      if (error.message?.includes("execution context destroyed") || 
+          error.message?.includes("Target closed")) {
+        log(`  ⚠ Execution context destroyed during extraction`);
+        if (page && !page.isClosed()) {
+          await page.close().catch(() => {});
+        }
+        return {
+          url: finalUrl || url,
+          title: "Error: Context destroyed",
+          status: "broken",
+          depth: 0,
+          links: [],
+        };
+      }
+      throw error;
+    }
     
     // If no links found, wait a bit more and try again (for SPAs that load links dynamically)
     if (links.length === 0) {
@@ -794,7 +1125,7 @@ async function crawlPage(
       await new Promise(resolve => setTimeout(resolve, 1500));
       
       // Scroll to trigger any lazy-loaded navigation
-      await page.evaluate(() => {
+      await safeEvaluate(page, () => {
         window.scrollTo(0, 0);
       });
       await new Promise(resolve => setTimeout(resolve, 500));
@@ -817,7 +1148,7 @@ async function crawlPage(
     if (links.length === 0) {
       log(`  ⚠ No links found on page`);
       // Debug: Log what's actually on the page
-      const pageDebug = await page.evaluate(() => {
+      const pageDebug = await safeEvaluate(page, () => {
         const body = document.body;
         if (!body) return { error: "No body" };
         return {
@@ -832,8 +1163,10 @@ async function crawlPage(
           readyState: document.readyState,
           url: window.location.href
         };
-      });
-      log(`  🔍 Debug info: ${JSON.stringify(pageDebug, null, 2)}`);
+      }, undefined, null) || null;
+      if (pageDebug) {
+        log(`  🔍 Debug info: ${JSON.stringify(pageDebug, null, 2)}`);
+      }
     } else if (internalLinks.length === 0 && links.length > 0) {
       log(`  ⚠ Found ${links.length} links but none are internal (all external)`);
       // Log first few external links for debugging
