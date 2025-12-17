@@ -1,7 +1,7 @@
 import type { Express } from "express";
 import { storage } from "./storage";
 import { setupAuth, isAuthenticated } from "./auth";
-import { crawlWebsite } from "./crawler";
+import { startCrawlWorker, getCrawlProgress } from "./worker";
 import { analyzeSitemap } from "./openai";
 import { urlInputSchema } from "@shared/schema";
 import { z } from "zod";
@@ -30,79 +30,14 @@ export async function registerRoutes(app: Express): Promise<void> {
       const crawl = await storage.createCrawl({
         userId,
         url,
-        status: "crawling",
+        status: "pending",
         maxDepth,
       });
       
-      // Start crawling in background
-      (async () => {
-        try {
-          console.log(`[Crawl] Starting crawl for ${url} (ID: ${crawl.id})`);
-          const result = await crawlWebsite(url, maxDepth);
-          
-          console.log(`[Crawl] Crawl completed: ${result.pagesFound} pages found`);
-          
-          // Update crawl status
-          const updated = await storage.updateCrawl(crawl.id, {
-            status: "completed",
-            pagesFound: result.pagesFound,
-            brokenLinks: result.brokenLinks,
-            duplicatePages: result.duplicatePages,
-            completedAt: new Date(),
-          });
-          
-          if (!updated) {
-            throw new Error("Failed to update crawl status");
-          }
-          
-          console.log(`[Crawl] Creating sitemap for crawl ${crawl.id}`);
-          console.log(`[Crawl] Sitemap data:`, JSON.stringify({
-            pages: result.pagesFound,
-            hasSitemap: !!result.sitemap,
-            hasXml: !!result.xmlContent,
-            sitemapKeys: result.sitemap ? Object.keys(result.sitemap) : [],
-          }));
-          
-          // Create sitemap record
-          try {
-            console.log(`[Crawl] Attempting to create sitemap with data:`, {
-              crawlId: crawl.id,
-              userId,
-              hasSitemap: !!result.sitemap,
-              sitemapType: typeof result.sitemap,
-              hasXml: !!result.xmlContent,
-              xmlLength: result.xmlContent?.length || 0,
-            });
-            
-            const sitemap = await storage.createSitemap({
-              crawlId: crawl.id,
-              userId,
-              originalJson: result.sitemap,
-              xmlContent: result.xmlContent,
-              isImproved: false,
-            });
-            
-            console.log(`[Crawl] ✅ Sitemap created successfully (ID: ${sitemap.id})`);
-          } catch (sitemapError: any) {
-            console.error(`[Crawl] ❌ Failed to create sitemap:`, sitemapError);
-            console.error(`[Crawl] Sitemap error message:`, sitemapError.message);
-            console.error(`[Crawl] Sitemap error stack:`, sitemapError.stack);
-            // Re-throw to mark crawl as failed since sitemap is critical
-            throw new Error(`Crawl completed but sitemap creation failed: ${sitemapError.message}`);
-          }
-        } catch (error: any) {
-          console.error("[Crawl] Error during crawl:", error);
-          console.error("[Crawl] Stack trace:", error.stack);
-          try {
-            await storage.updateCrawl(crawl.id, {
-              status: "failed",
-              errorMessage: error.message || "Unknown error",
-            });
-          } catch (updateError) {
-            console.error("[Crawl] Failed to update crawl status:", updateError);
-          }
-        }
-      })();
+      // Start crawl worker (runs in background)
+      startCrawlWorker(crawl.id, url, maxDepth).catch((error) => {
+        console.error(`[Routes] Failed to start crawl worker:`, error);
+      });
       
       res.json({ crawlId: crawl.id });
     } catch (error: any) {
@@ -143,16 +78,65 @@ export async function registerRoutes(app: Express): Promise<void> {
         return res.status(403).json({ message: "Access denied" });
       }
       
+      // Get real-time progress if available
+      const progress = getCrawlProgress(crawlId);
+      
       console.log(`[API] ✅ Crawl ${crawlId} found:`, {
         status: crawl.status,
         pagesFound: crawl.pagesFound,
         url: crawl.url,
+        hasProgress: !!progress,
       });
       
-      res.json(crawl);
+      // Merge progress data if available
+      const response = progress ? {
+        ...crawl,
+        currentUrl: progress.currentUrl,
+        queueSize: progress.queueSize,
+        progress: progress.progress,
+      } : crawl;
+      
+      res.json(response);
     } catch (error) {
       console.error("Error fetching crawl:", error);
       res.status(500).json({ message: "Failed to fetch crawl" });
+    }
+  });
+
+  // Get crawl progress (real-time updates)
+  app.get("/api/crawls/:id/progress", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.id;
+      const crawlId = req.params.id;
+      
+      // Verify crawl exists and belongs to user
+      const crawl = await storage.getCrawl(crawlId);
+      if (!crawl) {
+        return res.status(404).json({ message: "Crawl not found" });
+      }
+      
+      if (crawl.userId !== userId) {
+        return res.status(403).json({ message: "Access denied" });
+      }
+      
+      // Get real-time progress
+      const progress = getCrawlProgress(crawlId);
+      
+      if (progress) {
+        res.json(progress);
+      } else {
+        // Return database status if no real-time progress available
+        res.json({
+          crawlId,
+          status: crawl.status,
+          pagesFound: crawl.pagesFound || 0,
+          queueSize: 0,
+          progress: crawl.status === "completed" ? 100 : crawl.status === "failed" ? 0 : 50,
+        });
+      }
+    } catch (error) {
+      console.error("Error fetching crawl progress:", error);
+      res.status(500).json({ message: "Failed to fetch crawl progress" });
     }
   });
 

@@ -6,10 +6,28 @@ interface CrawlProgressProps {
   status: string;
   pagesFound?: number;
   currentUrl?: string;
+  progress?: number; // 0-100
+  queueSize?: number;
   className?: string;
 }
 
-export function CrawlProgress({ status, pagesFound = 0, currentUrl, className }: CrawlProgressProps) {
+export function CrawlProgress({ 
+  status, 
+  pagesFound = 0, 
+  currentUrl, 
+  progress,
+  queueSize = 0,
+  className 
+}: CrawlProgressProps) {
+  // Calculate progress percentage
+  const progressValue = progress !== undefined 
+    ? progress 
+    : status === "completed" 
+      ? 100 
+      : status === "failed" 
+        ? 0 
+        : undefined;
+
   return (
     <Card className={`${className || ""}`}>
       <CardContent className="p-8">
@@ -31,17 +49,26 @@ export function CrawlProgress({ status, pagesFound = 0, currentUrl, className }:
               {status === "completed" 
                 ? "Finalizing sitemap..." 
                 : pagesFound > 0 
-                  ? `Found ${pagesFound} pages so far` 
+                  ? `Found ${pagesFound} page${pagesFound !== 1 ? 's' : ''}${queueSize > 0 ? `, ${queueSize} in queue` : ''}` 
                   : "Discovering pages..."}
             </p>
           </div>
 
-          <Progress value={undefined} className="w-full max-w-xs h-2" />
+          <div className="w-full max-w-xs space-y-2">
+            <Progress value={progressValue} className="h-2" />
+            {progressValue !== undefined && (
+              <p className="text-xs text-muted-foreground">
+                {progressValue}% complete
+              </p>
+            )}
+          </div>
 
           {currentUrl && (
             <div className="flex items-center gap-2 text-sm text-muted-foreground max-w-md">
               <FileSearch className="h-4 w-4 shrink-0" />
-              <span className="truncate font-mono text-xs">{currentUrl}</span>
+              <span className="truncate font-mono text-xs" title={currentUrl}>
+                {currentUrl}
+              </span>
             </div>
           )}
         </div>

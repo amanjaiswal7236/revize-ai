@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
-import { Link } from "wouter";
+import { Link, useLocation } from "wouter";
 import { Header } from "@/components/Header";
 import { useAuth } from "@/hooks/useAuth";
 import { UrlInputCard } from "@/components/UrlInputCard";
@@ -33,6 +33,7 @@ import type { Crawl, Sitemap, SitemapNode, AIImprovement } from "@shared/schema"
 type ViewState = "input" | "crawling" | "results";
 
 export default function Home() {
+  const [location] = useLocation();
   const [viewState, setViewState] = useState<ViewState>("input");
   const [activeCrawlId, setActiveCrawlId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState("tree");
@@ -40,8 +41,21 @@ export default function Home() {
   const queryClient = useQueryClient();
   const { isAuthenticated } = useAuth();
 
+  // Read crawl query parameter from URL
+  useEffect(() => {
+    const urlParams = new URLSearchParams(window.location.search);
+    const crawlId = urlParams.get("crawl");
+    if (crawlId && crawlId !== activeCrawlId) {
+      console.log("[Home] Found crawl query parameter:", crawlId);
+      setActiveCrawlId(crawlId);
+      // Invalidate queries to ensure fresh data
+      queryClient.invalidateQueries({ queryKey: ["/api/crawls", crawlId] });
+      queryClient.invalidateQueries({ queryKey: ["/api/sitemaps", crawlId] });
+    }
+  }, [location, activeCrawlId, queryClient]);
+
   // Poll for crawl status - keep enabled even after completion to get final status
-  const { data: crawl, isLoading: crawlLoading, error: crawlError, refetch: refetchCrawl } = useQuery<Crawl>({
+  const { data: crawl, isLoading: crawlLoading, error: crawlError, refetch: refetchCrawl } = useQuery<Crawl & { progress?: number; currentUrl?: string; queueSize?: number }>({
     queryKey: ["/api/crawls", activeCrawlId],
     enabled: !!activeCrawlId,
     queryFn: async () => {
@@ -72,6 +86,7 @@ export default function Home() {
         crawlId: data?.id,
         status: data?.status,
         pagesFound: data?.pagesFound,
+        progress: data?.progress,
         activeCrawlId,
       });
     },
@@ -83,6 +98,25 @@ export default function Home() {
         error,
       });
     },
+  });
+
+  // Poll for real-time progress (separate endpoint for more frequent updates)
+  const { data: progress } = useQuery<{ progress: number; currentUrl?: string; queueSize: number; pagesFound: number }>({
+    queryKey: ["/api/crawls", activeCrawlId, "progress"],
+    enabled: !!activeCrawlId && (crawl?.status === "crawling" || crawl?.status === "pending"),
+    queryFn: async () => {
+      if (!activeCrawlId) throw new Error("No activeCrawlId");
+      const res = await fetch(`/api/crawls/${activeCrawlId}/progress`, {
+        credentials: "include",
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`${res.status}: ${text}`);
+      }
+      return res.json();
+    },
+    refetchInterval: 1000, // Poll every second for real-time updates
+    refetchOnMount: true,
   });
 
   // Debug activeCrawlId and crawl state
@@ -430,9 +464,12 @@ export default function Home() {
 
         {viewState === "crawling" && (
           <div className="max-w-2xl mx-auto py-12">
-            <CrawlProgress 
-              status={crawl?.status || "pending"} 
-              pagesFound={crawl?.pagesFound || 0}
+            <CrawlProgress
+              status={crawl?.status || "pending"}
+              pagesFound={progress?.pagesFound ?? crawl?.pagesFound ?? 0}
+              currentUrl={progress?.currentUrl ?? crawl?.currentUrl}
+              progress={progress?.progress ?? crawl?.progress}
+              queueSize={progress?.queueSize ?? crawl?.queueSize ?? 0}
             />
           </div>
         )}
